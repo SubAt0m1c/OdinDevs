@@ -30,10 +30,6 @@ impl ArcStr {
         Self(Arc::from(s))
     }
 
-    pub fn from_string(s: String) -> Self {
-        Self(Arc::from(s))
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }

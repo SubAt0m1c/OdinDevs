@@ -3,8 +3,9 @@ use std::{collections::BinaryHeap, env, fmt::{Debug, Display}, io, str::FromStr,
 use actix_web::{App, HttpServer, main, web::Data};
 use redb::{Database, ReadableDatabase, ReadableTable, StorageError};
 use tokio::{sync::mpsc::{error::TryRecvError, unbounded_channel}, task::spawn_blocking, time::{Instant, sleep_until}};
+use uuid::Uuid;
 
-use crate::{arc_str::ArcStr, devs::{CachedDevs, DEV_TABLE, DEV_TTLS}};
+use crate::{devs::{CachedDevs, DEV_TABLE, DEV_TTLS}};
 
 mod arc_str;
 mod devs;
@@ -67,12 +68,12 @@ async fn main() -> io::Result<()> {
                             
                             for entry in to_delete {
                                 {
-                                    let Some(ttl) = ttl_table.get(&entry.name).map_err(io::Error::other)? else { continue };
+                                    let Some(ttl) = ttl_table.get(&entry.uuid).map_err(io::Error::other)? else { continue };
                                     if ttl.value().generation != entry.generation { continue }
                                 }
     
-                                entry_table.remove(&entry.name).map_err(io::Error::other)?;
-                                ttl_table.remove(&entry.name).map_err(io::Error::other)?;
+                                entry_table.remove(&entry.uuid).map_err(io::Error::other)?;
+                                ttl_table.remove(&entry.uuid).map_err(io::Error::other)?;
                             }
                         }
     
@@ -100,12 +101,16 @@ async fn main() -> io::Result<()> {
         }
     });
 
+    let reqwest = Data::new(reqwest::Client::new());
+    
     let tx = Data::new(tx);
     HttpServer::new(move || {
         App::new()
             .app_data(database.clone())
             .app_data(cached.clone())
             .app_data(tx.clone())
+            .app_data(reqwest.clone())
+            
             .service(devs::devs_list)
             .service(devs::update_devs)
     })
@@ -117,7 +122,7 @@ async fn main() -> io::Result<()> {
 /// min heap pending
 #[derive(Debug)]
 pub struct PendingDev {
-    pub name: ArcStr,
+    pub uuid: Uuid,
     pub delete_at: u64,
     pub generation: u64,
 }
@@ -174,7 +179,7 @@ fn load_db(db: &Database) -> Result<BinaryHeap<PendingDev>, io::Error> {
         .map(|res| {
             let (key, value) = res?;
             let delete_time = value.value();
-            Ok::<_, StorageError>(PendingDev { name: key.value().clone(), delete_at: delete_time.delete_at_unix, generation: delete_time.generation })
+            Ok::<_, StorageError>(PendingDev { uuid: key.value(), delete_at: delete_time.delete_at_unix, generation: delete_time.generation })
         })
         .collect::<Result<BinaryHeap<_>, _>>()
         .map_err(io::Error::other)?;

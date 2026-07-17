@@ -5,6 +5,7 @@ use arc_swap::ArcSwapOption;
 use redb::{Database, ReadableDatabase, ReadableTable, StorageError, TableDefinition, TypeName};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc::UnboundedSender, task::spawn_blocking};
+use uuid::Uuid;
 
 use crate::{PendingDev, arc_str::ArcStr, env_var, unix_secs};
 
@@ -14,8 +15,8 @@ static UPDATE_PASSWORD: LazyLock<String> = LazyLock::new(|| env_var("UPDATE_PASS
 static CREATE_PASSWORD: LazyLock<String> = LazyLock::new(|| env_var("CREATE_PASSWORD", "CHANGETHIS_CREATE".to_owned ()));
 static DELETE_PASSWORD: LazyLock<String> = LazyLock::new(|| env_var("DELETE_PASSWORD", "CHANGETHIS_DELETE".to_owned ()));
 
-pub const DEV_TABLE: TableDefinition<ArcStr, DevPlayer> = TableDefinition::new("dev_data");
-pub const DEV_TTLS: TableDefinition<ArcStr, GenerationalDeleteTime> = TableDefinition::new("dev_ttls");
+pub const DEV_TABLE: TableDefinition<Uuid, DevPlayer> = TableDefinition::new("dev_data");
+pub const DEV_TTLS: TableDefinition<Uuid, GenerationalDeleteTime> = TableDefinition::new("dev_ttls");
 
 pub struct CachedDevs {
     pub devs: DevCache
@@ -62,16 +63,22 @@ pub async fn update_devs(
     body: Json<UpdateData>,
     db: Data<Database>,
     devs: Data<CachedDevs>,
+    reqwest: Data<reqwest::Client>,
     ttl_tx: Data<UnboundedSender<PendingDev>>
 ) -> Result<impl Responder> {
     let data = body.into_inner();
+    let url = format!("https://mowojang.seraph.si/users/profiles/minecraft/{}", data.name);
+    let uuid_data = reqwest.get(url)
+        .send().await.map_err(io::Error::other)?
+        .json::<UuidResponse>().await.map_err(io::Error::other)?;
 
+    
     let res = spawn_blocking(move || {
         match &data.password {
             password if password == &*UPDATE_PASSWORD => {
                 let read_txn = db.begin_read().map_err(io::Error::other)?;
                 let table = read_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
-                let dev = table.get(&data.dev_name).map_err(io::Error::other)?;
+                let dev = table.get(&uuid_data.uuid).map_err(io::Error::other)?;
                 if dev.is_none() {
                     return Ok("User does not exist!".to_string())
                 }
@@ -80,7 +87,7 @@ pub async fn update_devs(
                 let write_txn = db.begin_write().map_err(io::Error::other)?;
                 let removed = {
                     let mut dev_table = write_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
-                    dev_table.remove(&data.dev_name).map_err(io::Error::other)?.is_some()
+                    dev_table.remove(&uuid_data.uuid).map_err(io::Error::other)?.is_some()
                     // we dont delete from ttl table since if they get re-added with a later ttl, the generation may get reused 
                     // while the entry is still in the removal queue, removing them early.
                     // leaving them in the ttl table until the normal expiration prevents generation reuse
@@ -89,7 +96,7 @@ pub async fn update_devs(
                 let removed = if removed {
                     write_txn.commit().map_err(io::Error::other)?;
                     devs.devs.store(None);
-                    format!("Deleted user {}", data.dev_name)
+                    format!("Deleted user {}", uuid_data.name)
                 } else {
                     "User not found".to_string()
                 };
@@ -98,10 +105,11 @@ pub async fn update_devs(
             }
             password if password == &*CREATE_PASSWORD => {
                 let read_txn = db.begin_read().map_err(io::Error::other)?;
-                let table = read_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
-                let dev = table.get(&data.dev_name).map_err(io::Error::other)?;
-                if dev.is_some() {
-                    return Ok("User already exists".to_string())
+                if let Ok(table) = read_txn.open_table(DEV_TABLE) {
+                    let dev = table.get(&uuid_data.uuid).map_err(io::Error::other)?;
+                    if dev.is_some() {
+                        return Ok(format!("{} already exists!", uuid_data.name))
+                    }
                 }
             }
             _ => return Ok("Not Authorized!".to_string())
@@ -110,20 +118,20 @@ pub async fn update_devs(
         let write_txn = db.begin_write().map_err(io::Error::other)?;
         if let Some(delete_in) = &data.delete_in {
             let mut table = write_txn.open_table(DEV_TTLS).map_err(io::Error::other)?;
-            let generation = match table.get(&data.dev_name).map_err(io::Error::other)? {
+            let generation = match table.get(&uuid_data.uuid).map_err(io::Error::other)? {
                 Some(entry) => entry.value().generation.wrapping_add(1),
                 None => 0,
             };
             
             let delete_at = unix_secs() + *delete_in;
-            table.insert(&data.dev_name, GenerationalDeleteTime { generation, delete_at_unix: delete_at }).map_err(io::Error::other)?;
-            ttl_tx.send(PendingDev { name: data.dev_name.clone(), delete_at, generation }).map_err(io::Error::other)?;
+            table.insert(&uuid_data.uuid, GenerationalDeleteTime { generation, delete_at_unix: delete_at }).map_err(io::Error::other)?;
+            ttl_tx.send(PendingDev { uuid: uuid_data.uuid, delete_at, generation }).map_err(io::Error::other)?;
         }
         
-        let player = data.dev();
+        let player = data.dev(uuid_data);
         {
             let mut table = write_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
-            table.insert(&player.dev_name, &player).map_err(io::Error::other)?;
+            table.insert(&player.uuid, &player).map_err(io::Error::other)?;
         }
         
         write_txn.commit().map_err(io::Error::other)?;
@@ -138,7 +146,7 @@ pub async fn update_devs(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateData {
     #[serde(rename = "DevName")]
-    dev_name: ArcStr,
+    name: ArcStr,
     
     #[serde(rename = "Size")]
     size: [f32; 3],
@@ -154,9 +162,10 @@ pub struct UpdateData {
 }
 
 impl UpdateData {
-    fn dev(self) -> DevPlayer {
+    fn dev(self, uuid_res: UuidResponse) -> DevPlayer {
         DevPlayer {
-            dev_name: self.dev_name,
+            uuid: uuid_res.uuid,
+            dev_name: uuid_res.name,
             size: self.size,
             custom_name: self.custom_name,
         }
@@ -165,6 +174,9 @@ impl UpdateData {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DevPlayer {
+    #[serde(rename = "Uuid")]
+    uuid: Uuid,
+    
     #[serde(rename = "DevName")]
     dev_name: ArcStr,
     
@@ -233,4 +245,12 @@ impl redb::Value for GenerationalDeleteTime {
     fn type_name() -> redb::TypeName {
         TypeName::new("odindevs::generational_delete_time")
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UuidResponse {
+    #[serde(rename = "id")]
+    uuid: Uuid,
+    #[serde(rename = "name")]
+    name: ArcStr,
 }
