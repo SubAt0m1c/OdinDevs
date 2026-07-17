@@ -95,8 +95,8 @@ pub async fn update_devs(
         }
         
         write_txn.commit().map_err(io::Error::other)?;
-        
         devs.devs.store(None);
+        
         Ok::<_, io::Error>(format!("Added user {} with custom_name {}", player.dev_name, player.custom_name))
     }).await.map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))??;
     
