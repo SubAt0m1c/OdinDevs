@@ -6,15 +6,16 @@ use redb::{Database, ReadableDatabase, ReadableTable, StorageError, TableDefinit
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc::UnboundedSender, task::spawn_blocking};
 
-use crate::{PendingDev, arc_str::ArcStr, env_var};
+use crate::{PendingDev, arc_str::ArcStr, env_var, unix_secs};
 
 type DevCache = ArcSwapOption<Vec<DevPlayer>>;
 
 static UPDATE_PASSWORD: LazyLock<String> = LazyLock::new(|| env_var("UPDATE_PASSWORD", "CHANGETHIS_UPDATE".to_owned ()));
 static CREATE_PASSWORD: LazyLock<String> = LazyLock::new(|| env_var("CREATE_PASSWORD", "CHANGETHIS_CREATE".to_owned ()));
+static DELETE_PASSWORD: LazyLock<String> = LazyLock::new(|| env_var("DELETE_PASSWORD", "CHANGETHIS_DELETE".to_owned ()));
 
 pub const DEV_TABLE: TableDefinition<ArcStr, DevPlayer> = TableDefinition::new("dev_data");
-pub const DEV_TTLS: TableDefinition<ArcStr, u64> = TableDefinition::new("dev_ttls");
+pub const DEV_TTLS: TableDefinition<ArcStr, GenerationalDeleteTime> = TableDefinition::new("dev_ttls");
 
 pub struct CachedDevs {
     pub devs: DevCache
@@ -75,23 +76,47 @@ pub async fn update_devs(
                     return Ok("Nope".to_string())
                 }
             }
-            password if password == &*CREATE_PASSWORD => {}
-            _ => {
-                return Ok("Nope!".to_string());
+            password if password == &*DELETE_PASSWORD => {
+                let write_txn = db.begin_write().map_err(io::Error::other)?;
+                let removed = {
+                    let mut dev_table = write_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
+                    dev_table.remove(&data.dev_name).map_err(io::Error::other)?.is_some()
+                    // we dont delete from ttl table since if they get re-added with a later ttl, the generation may get reused 
+                    // while the entry is still in the removal queue, removing them early.
+                    // leaving them in the ttl table until the normal expiration prevents generation reuse
+                };
+
+                let removed = if removed {
+                    write_txn.commit().map_err(io::Error::other)?;
+                    devs.devs.store(None);
+                    format!("Deleted user {}", data.dev_name)
+                } else {
+                    "User not found".to_string()
+                };
+                
+                return Ok(removed);
             }
+            password if password == &*CREATE_PASSWORD => {}
+            _ => return Ok("Nope!".to_string())
         }
         
         let write_txn = db.begin_write().map_err(io::Error::other)?;
-        if let Some(delete_time) = &data.delete_at_unix {
+        if let Some(delete_in) = &data.delete_in {
             let mut table = write_txn.open_table(DEV_TTLS).map_err(io::Error::other)?;
-            table.insert(&data.custom_name, delete_time).map_err(io::Error::other)?;
-            ttl_tx.send(PendingDev { name: data.custom_name.clone(), delete_at: *delete_time }).map_err(io::Error::other)?;
+            let generation = match table.get(&data.dev_name).map_err(io::Error::other)? {
+                Some(entry) => entry.value().generation.wrapping_add(1),
+                None => 0,
+            };
+            
+            let delete_at = unix_secs() + *delete_in;
+            table.insert(&data.dev_name, GenerationalDeleteTime { generation, delete_at_unix: delete_at }).map_err(io::Error::other)?;
+            ttl_tx.send(PendingDev { name: data.dev_name.clone(), delete_at, generation }).map_err(io::Error::other)?;
         }
         
         let player = data.dev();
         {
             let mut table = write_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
-            table.insert(&player.custom_name, &player).map_err(io::Error::other)?;
+            table.insert(&player.dev_name, &player).map_err(io::Error::other)?;
         }
         
         write_txn.commit().map_err(io::Error::other)?;
@@ -117,8 +142,8 @@ pub struct UpdateData {
     #[serde(rename = "Password")]
     password: String,
 
-    #[serde(rename = "DeleteAtUnix", default, skip_serializing_if = "Option::is_none")]
-    delete_at_unix: Option<u64>,
+    #[serde(rename = "DeleteIn", default, skip_serializing_if = "Option::is_none")]
+    delete_in: Option<u64>,
 }
 
 impl UpdateData {
@@ -163,5 +188,42 @@ impl redb::Value for DevPlayer {
 
     fn type_name() -> redb::TypeName {
         TypeName::new("odindevs::dev_player")
+    }
+}
+
+#[derive(Debug)]
+pub struct GenerationalDeleteTime {
+    pub generation: u64,
+    pub delete_at_unix: u64,
+}
+
+impl redb::Value for GenerationalDeleteTime {
+    type SelfType<'a> = GenerationalDeleteTime;
+    type AsBytes<'a> = [u8; 16];
+
+    fn fixed_width() -> Option<usize> {
+        Some(size_of::<[u8; 16]>())
+    }
+
+    fn from_bytes<'a>(data: &[u8]) -> Self::SelfType<'a> {
+        let bytes: [u8; 16] = data.try_into().unwrap();
+        let compact = u128::from_be_bytes(bytes);
+        Self {
+            #[allow(clippy::cast_possible_truncation)]
+            generation: compact as u64,
+            delete_at_unix: (compact >> 64) as u64,
+        }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'b
+    {
+        let compact = u128::from(value.generation) | (u128::from(value.delete_at_unix) << 64);
+        compact.to_be_bytes()
+    }
+
+    fn type_name() -> redb::TypeName {
+        TypeName::new("odindevs::generational_delete_time")
     }
 }

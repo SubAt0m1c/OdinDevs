@@ -53,30 +53,36 @@ async fn main() -> io::Result<()> {
                     let entry = pending_devs.pop().expect("Should have verified heap.peak() isn't None");
                     to_delete.push(entry);
                 }
-                continue;
-            }
 
-            if !to_delete.is_empty() {
-                let blocking_devs = thread_devs.clone();
-                let blocking_db = thread_db.clone();
-                spawn_blocking(move || {
-                    let write_txn = blocking_db.begin_write().map_err(io::Error::other)?;
-
-                    {
-                        let mut entry_table = write_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
-                        let mut ttl_table = write_txn.open_table(DEV_TTLS).map_err(io::Error::other)?;
-                        
-                        
-                        for entry in to_delete {
-                            entry_table.remove(&entry.name).map_err(io::Error::other)?;
-                            ttl_table.remove(&entry.name).map_err(io::Error::other)?;
+                if !to_delete.is_empty() {
+                    let blocking_devs = thread_devs.clone();
+                    let blocking_db = thread_db.clone();
+                    spawn_blocking(move || {
+                        let write_txn = blocking_db.begin_write().map_err(io::Error::other)?;
+    
+                        {
+                            let mut entry_table = write_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
+                            let mut ttl_table = write_txn.open_table(DEV_TTLS).map_err(io::Error::other)?;
+                            
+                            
+                            for entry in to_delete {
+                                {
+                                    let Some(ttl) = ttl_table.get(&entry.name).map_err(io::Error::other)? else { continue };
+                                    if ttl.value().generation != entry.generation { continue }
+                                }
+    
+                                entry_table.remove(&entry.name).map_err(io::Error::other)?;
+                                ttl_table.remove(&entry.name).map_err(io::Error::other)?;
+                            }
                         }
-                    }
-
-                    write_txn.commit().map_err(io::Error::other)?;
-                    blocking_devs.devs.swap(None);
-                    Ok::<(), io::Error>(())
-                });
+    
+                        write_txn.commit().map_err(io::Error::other)?;
+                        blocking_devs.devs.swap(None);
+                        Ok::<(), io::Error>(())
+                    });
+                }
+                
+                continue;
             }
 
             let duration_until_wake = Duration::from_secs(next.saturating_sub(now));
@@ -109,9 +115,11 @@ async fn main() -> io::Result<()> {
 }
 
 /// min heap pending
+#[derive(Debug)]
 pub struct PendingDev {
     pub name: ArcStr,
     pub delete_at: u64,
+    pub generation: u64,
 }
 
 impl PartialOrd for PendingDev {
@@ -165,7 +173,8 @@ fn load_db(db: &Database) -> Result<BinaryHeap<PendingDev>, io::Error> {
     let items = iter
         .map(|res| {
             let (key, value) = res?;
-            Ok::<_, StorageError>(PendingDev { name: key.value().clone(), delete_at: value.value() })
+            let delete_time = value.value();
+            Ok::<_, StorageError>(PendingDev { name: key.value().clone(), delete_at: delete_time.delete_at_unix, generation: delete_time.generation })
         })
         .collect::<Result<BinaryHeap<_>, _>>()
         .map_err(io::Error::other)?;
