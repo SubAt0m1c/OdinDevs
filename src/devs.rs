@@ -41,15 +41,15 @@ pub async fn devs_list(
         None => spawn_blocking(move || {
             let read_txn = db.begin_read().map_err(io::Error::other)?;
             let table = read_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
-            let items = table.iter().map_err(io::Error::other)?;
-            let items = items
+            let items = table
+                .iter().map_err(io::Error::other)?
                 .map(|res| {
                     let (_, value) = res?;
                     Ok::<_, StorageError>(value.value())
                 })
                 .collect::<Result<Vec<_>, _>>().map_err(io::Error::other)?;
-            let items = Arc::new(items);
             
+            let items = Arc::new(items);
             devs.devs.store(Some(items.clone()));
             Ok::<_, io::Error>(items)
         }).await.map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))??,
