@@ -73,7 +73,7 @@ pub async fn update_devs(
                 let table = read_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
                 let dev = table.get(&data.dev_name).map_err(io::Error::other)?;
                 if dev.is_none() {
-                    return Ok("Nope".to_string())
+                    return Ok("User does not exist!".to_string())
                 }
             }
             password if password == &*DELETE_PASSWORD => {
@@ -96,8 +96,15 @@ pub async fn update_devs(
                 
                 return Ok(removed);
             }
-            password if password == &*CREATE_PASSWORD => {}
-            _ => return Ok("Nope!".to_string())
+            password if password == &*CREATE_PASSWORD => {
+                let read_txn = db.begin_read().map_err(io::Error::other)?;
+                let table = read_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
+                let dev = table.get(&data.dev_name).map_err(io::Error::other)?;
+                if dev.is_some() {
+                    return Ok("User already exists".to_string())
+                }
+            }
+            _ => return Ok("Not Authorized!".to_string())
         }
         
         let write_txn = db.begin_write().map_err(io::Error::other)?;
