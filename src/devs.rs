@@ -1,20 +1,20 @@
-use std::{fmt::format, sync::{Arc, LazyLock}};
+use std::{io, sync::{Arc, LazyLock}};
 
-use actix_web::{HttpResponse, Responder, Result, body, get, http::StatusCode, post, web::{Bytes, Data, Json}};
+use actix_web::{HttpResponse, Responder, Result, get, http::StatusCode, post, web::{Data, Json}};
 use arc_swap::ArcSwapOption;
 use redb::{Database, ReadableDatabase, ReadableTable, StorageError, TableDefinition, TypeName};
 use serde::{Deserialize, Serialize};
-use simd_json::deserialize;
-use tokio::task::spawn_blocking;
+use tokio::{sync::mpsc::UnboundedSender, task::spawn_blocking};
 
-use crate::env_var;
+use crate::{PendingDev, arc_str::ArcStr, env_var};
 
 type DevCache = ArcSwapOption<Vec<DevPlayer>>;
 
 static UPDATE_PASSWORD: LazyLock<String> = LazyLock::new(|| env_var("UPDATE_PASSWORD", "CHANGETHIS_UPDATE".to_owned ()));
 static CREATE_PASSWORD: LazyLock<String> = LazyLock::new(|| env_var("CREATE_PASSWORD", "CHANGETHIS_CREATE".to_owned ()));
 
-pub const DEV_TABLE: TableDefinition<String, DevPlayer> = TableDefinition::new("dev_data");
+pub const DEV_TABLE: TableDefinition<ArcStr, DevPlayer> = TableDefinition::new("dev_data");
+pub const DEV_TTLS: TableDefinition<ArcStr, u64> = TableDefinition::new("dev_ttls");
 
 pub struct CachedDevs {
     pub devs: DevCache
@@ -33,25 +33,24 @@ pub async fn devs_list(
     db: Data<Database>,
     devs: Data<CachedDevs>
 ) -> Result<impl Responder> {
-    let read_txn = db.begin_read().map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
-    let table = read_txn.open_table(DEV_TABLE).map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
-
     #[allow(clippy::single_match_else)]
     let devs = match devs.devs.load().as_ref().cloned() {
         Some(devs) => devs,
-        None => {
-            let items = table.iter().map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
+        None => spawn_blocking(move || {
+            let read_txn = db.begin_read().map_err(io::Error::other)?;
+            let table = read_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
+            let items = table.iter().map_err(io::Error::other)?;
             let items = items
                 .map(|res| {
                     let (_, value) = res?;
                     Ok::<_, StorageError>(value.value())
                 })
-                .collect::<Result<Vec<_>, _>>().map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
+                .collect::<Result<Vec<_>, _>>().map_err(io::Error::other)?;
             let items = Arc::new(items);
             
             devs.devs.store(Some(items.clone()));
-            items
-        }
+            Ok::<_, io::Error>(items)
+        }).await.map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))??,
     };
 
     Ok(HttpResponse::Ok().json(&*devs))   
@@ -62,49 +61,64 @@ pub async fn update_devs(
     body: Json<UpdateData>,
     db: Data<Database>,
     devs: Data<CachedDevs>,
+    ttl_tx: Data<UnboundedSender<PendingDev>>
 ) -> Result<impl Responder> {
     let data = body.into_inner();
-    
-    match &data.password {
-        password if password == &*UPDATE_PASSWORD => {
-            let read_txn = db.begin_read().map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
-            let table = read_txn.open_table(DEV_TABLE).map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
-            let dev = table.get(&data.dev_name).map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
-            if dev.is_none() {
-                return Err(actix_web::error::ErrorNotFound("Nope"));
+
+    let res = spawn_blocking(move || {
+        match &data.password {
+            password if password == &*UPDATE_PASSWORD => {
+                let read_txn = db.begin_read().map_err(io::Error::other)?;
+                let table = read_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
+                let dev = table.get(&data.dev_name).map_err(io::Error::other)?;
+                if dev.is_none() {
+                    return Ok("Nope".to_string())
+                }
+            }
+            password if password == &*CREATE_PASSWORD => {}
+            _ => {
+                return Ok("Nope!".to_string());
             }
         }
-        password if password == &*CREATE_PASSWORD => {}
-        _ => {
-            return Err(actix_web::error::ErrorForbidden("Nope!"));
+        
+        let write_txn = db.begin_write().map_err(io::Error::other)?;
+        if let Some(delete_time) = &data.delete_at_unix {
+            let mut table = write_txn.open_table(DEV_TTLS).map_err(io::Error::other)?;
+            table.insert(&data.custom_name, delete_time).map_err(io::Error::other)?;
+            ttl_tx.send(PendingDev { name: data.custom_name.clone(), delete_at: *delete_time }).map_err(io::Error::other)?;
         }
-    }
-
-    let player = data.dev();
-    let write_txn = db.begin_write().map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
-    {
-        let mut table = write_txn.open_table(DEV_TABLE).map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
-        table.insert(&player.custom_name, &player).map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
-    }
-    write_txn.commit().map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))?;
+        
+        let player = data.dev();
+        {
+            let mut table = write_txn.open_table(DEV_TABLE).map_err(io::Error::other)?;
+            table.insert(&player.custom_name, &player).map_err(io::Error::other)?;
+        }
+        
+        write_txn.commit().map_err(io::Error::other)?;
+        
+        devs.devs.store(None);
+        Ok::<_, io::Error>(format!("Added user {} with custom_name {}", player.dev_name, player.custom_name))
+    }).await.map_err(|e| actix_web::error::InternalError::new(e, StatusCode::INTERNAL_SERVER_ERROR))??;
     
-    devs.devs.store(None);
-    Ok(HttpResponse::Ok().json(format!("Added user {} with custom_name {}", player.dev_name, player.custom_name)))
+    Ok(HttpResponse::Ok().body(res))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateData {
     #[serde(rename = "DevName")]
-    dev_name: String,
+    dev_name: ArcStr,
     
     #[serde(rename = "Size")]
     size: [f32; 3],
     
     #[serde(rename = "CustomName")]
-    custom_name: String,
+    custom_name: ArcStr,
 
     #[serde(rename = "Password")]
     password: String,
+
+    #[serde(rename = "DeleteAtUnix", default, skip_serializing_if = "Option::is_none")]
+    delete_at_unix: Option<u64>,
 }
 
 impl UpdateData {
@@ -120,13 +134,13 @@ impl UpdateData {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DevPlayer {
     #[serde(rename = "DevName")]
-    dev_name: String,
+    dev_name: ArcStr,
     
     #[serde(rename = "Size")]
     size: [f32; 3],
     
     #[serde(rename = "CustomName")]
-    custom_name: String,
+    custom_name: ArcStr,
 }
 
 impl redb::Value for DevPlayer {
